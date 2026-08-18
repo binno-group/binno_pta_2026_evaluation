@@ -1,0 +1,8 @@
+services:
+  binno:
+    environment:
+      OLTP_READ_DATABASE_URL: postgres://binno:binno@postgres-oltp-replica:5432/binno?sslmode=disable
+      OLTP_READ_MAX_CONNS: "20"
+    depends_on:
+      postgres-oltp-replica:
+        condition: service_healthy

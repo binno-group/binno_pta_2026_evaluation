@@ -1,0 +1,38 @@
+services:
+  postgres-oltp:
+    command: >-
+      postgres
+      -c shared_buffers=4GB
+      -c effective_cache_size=24GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=1GB
+      -c max_connections=200
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_parallel_workers_per_gather=0
+      -c max_worker_processes=16
+      -c max_wal_size=8GB
+      -c wal_compression=on
+      -c checkpoint_completion_target=0.9
+      -c track_io_timing=on
+  postgres-analytics:
+    command: >-
+      postgres
+      -c shared_buffers=1GB
+      -c effective_cache_size=4GB
+      -c work_mem=16MB
+      -c max_connections=50
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_parallel_workers_per_gather=0
+      -c max_worker_processes=4
+      -c max_wal_size=2GB
+      -c wal_compression=on
+  redis:
+    command: >-
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      --maxmemory 4gb
+      --maxmemory-policy volatile-ttl
+      --save 900 1
+      --appendonly no

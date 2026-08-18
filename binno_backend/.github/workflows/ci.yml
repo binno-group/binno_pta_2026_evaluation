@@ -1,0 +1,126 @@
+name: ci
+on:
+  pull_request:
+  push: { branches: [master] }
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Build the release image
+        run: docker build --build-arg TARGET=binno -t binno:scan .
+      - name: Extract the shipped binary
+        run: |
+          cid=$(docker create binno:scan)
+          docker cp "$cid:/app" ./binno-shipped
+          docker rm "$cid"
+          go version -m ./binno-shipped | head -2
+      - name: Scan the shipped binary
+        run: govulncheck -mode=binary ./binno-shipped
+
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyyaml
+      - name: install sqlc
+        run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
+      - run: scripts/todo-gate.sh
+      - run: scripts/migration-pairs.sh
+      - run: scripts/openapi-drift.sh
+      - run: scripts/no-latest.sh
+      - run: scripts/mutating-routes.sh
+      - run: scripts/sqlc-drift.sh
+      - run: scripts/status-write.sh
+      - run: scripts/table-ownership.sh
+      - run: scripts/alerts-presence.sh
+      - run: go test ./tests/arch/... -count=1
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go test ./... -short -race -count=1
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env: { POSTGRES_USER: binno, POSTGRES_PASSWORD: binno, POSTGRES_DB: binno_test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U binno" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      postgres-analytics:
+        image: postgres:16.4
+        env: { POSTGRES_USER: binno, POSTGRES_PASSWORD: binno, POSTGRES_DB: binno_analytics_test }
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U binno" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8.4.13-alpine
+        env: { CLICKHOUSE_DB: analytics }
+        ports: ["8123:8123"]
+        options: >-
+          --health-cmd "wget -qO- 'http://localhost:8123/?query=SELECT%201' >/dev/null"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+    env:
+      TEST_DB_URL: postgres://binno:binno@localhost:5432/binno_test?sslmode=disable
+      TEST_ANALYTICS_DB_URL: postgres://binno:binno@localhost:5433/binno_analytics_test?sslmode=disable
+      TEST_CLICKHOUSE_URL: http://localhost:8123
+      TEST_REDIS_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: install golang-migrate
+        run: go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.18.1
+      - name: OLTP migrations up-down-up (rollback proof, every module dir)
+        run: make migrate-cycle DB_URL="$TEST_DB_URL"
+      - name: analytics migrations up-down-up (rollback proof)
+        run: make migrate-analytics-cycle ANALYTICS_DB_URL="$TEST_ANALYTICS_DB_URL"
+      - name: apply ClickHouse analytics DDL
+        run: curl --fail --data-binary @migrations/analytics/clickhouse_analytics_events.sql "http://localhost:8123/?database=analytics&multiquery=1"
+      - run: go test ./... -tags=integration -count=1
+      - run: scripts/coverage-gate.sh
+
+  build:
+    needs: [lint, gates, unit, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build-sha-tag
+        run: |
+          docker build --build-arg TARGET=binno -t binno-api:${{ github.sha }} .
+          docker build --build-arg TARGET=dispatcher -t binno-dispatcher:${{ github.sha }} .
+      - name: verify images exist under their SHA tag
+        run: |
+          docker inspect binno-api:${{ github.sha }} > /dev/null
+          docker inspect binno-dispatcher:${{ github.sha }} > /dev/null

@@ -1,0 +1,94 @@
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags: [integration, routedump]
+
+linters:
+  default: none
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - revive
+    - gosec
+    - gocritic
+    - depguard
+    - forbidigo
+    - gochecknoglobals
+    - gochecknoinits
+    - misspell
+    - musttag
+    - unconvert
+    - unused
+
+  settings:
+    depguard:
+      rules:
+        platform-purity:
+          files: ["**/internal/platform/**"]
+          deny:
+            - pkg: github.com/binnoapp-glitch/binno_backend/internal/modules
+              desc: platform must stay business-free
+        modules-no-cmd:
+          files: ["**/internal/modules/**"]
+          deny:
+            - pkg: github.com/binnoapp-glitch/binno_backend/cmd
+              desc: modules must not depend on wiring
+        no-orm:
+          files: ["**/*.go"]
+          deny:
+            - pkg: gorm.io
+              desc: no ORM
+            - pkg: entgo.io
+              desc: no ORM
+            - pkg: xorm.io
+              desc: no ORM
+
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^time\.Now$
+          msg: inject platform/runtime/clock.Clock
+        - pattern: ^fmt\.(Print|Printf|Println)$
+          msg: use slog
+        - pattern: ^math/rand\.
+          msg: use crypto/rand or an injected source
+
+    revive:
+      rules:
+        - name: package-comments
+        - name: context-as-argument
+        - name: error-return
+
+    gosec:
+      excludes: []
+
+  exclusions:
+    rules:
+      - path: internal/platform/runtime/clock/
+        linters: [forbidigo]
+      - path: internal/platform/database/geo/
+        linters: [forbidigo]
+      - path: internal/modules/operator/repository_clickhouse\.go
+        text: "G704:"
+        linters: [gosec]
+      - path: internal/platform/telemetry/otelx/saturation\.go
+        linters: [forbidigo, gochecknoglobals]
+      - path: internal/modules/identity/handler\.go
+        text: "G117:"
+        linters: [gosec]
+      - path: _test\.go
+        linters: [gochecknoglobals, forbidigo]
+      - path: _test\.go
+        text: "(G304|G704):"
+        linters: [gosec]
+
+formatters:
+  enable:
+    - gofumpt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+# nolint policy: every //nolint MUST carry a linter name and an issue link, e.g.

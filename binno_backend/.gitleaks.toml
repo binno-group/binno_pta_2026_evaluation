@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+[[allowlists]]
+description = "Bare UUIDs (entity ids, Idempotency-Key values)"
+regexTarget = "secret"
+regexes = ['''^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$''']

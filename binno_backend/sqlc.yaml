@@ -1,0 +1,119 @@
+version: "2"
+
+sql:
+  - name: location
+    engine: postgresql
+    schema: &oltp_schema
+      - migrations/identity/000001_create_identity.up.sql
+      - migrations/location/000001_create_location.up.sql
+      - migrations/catalog/000001_create_catalog.up.sql
+      - migrations/orders/000001_create_orders.up.sql
+      - migrations/billing/000001_create_billing.up.sql
+      - migrations/trust/000001_create_feedback.up.sql
+      - migrations/platform/000001_create_platform.up.sql
+    queries: internal/modules/location/store
+    gen:
+      go: &go_options
+        package: store
+        out: internal/modules/location/store
+        sql_package: pgx/v5
+        emit_db_tags: true
+        emit_json_tags: true
+        emit_empty_slices: true
+        emit_interface: false
+        emit_pointers_for_null_types: true
+        emit_result_struct_pointers: true
+        emit_params_struct_pointers: true
+        omit_unused_structs: true
+        overrides: &go_overrides
+          - db_type: geography
+            go_type:
+              import: github.com/binnoapp-glitch/binno_backend/internal/platform/database/geo
+              package: geo
+              type: EWKB
+          - db_type: geography
+            nullable: true
+            go_type:
+              import: github.com/binnoapp-glitch/binno_backend/internal/platform/database/geo
+              package: geo
+              type: EWKB
+              pointer: true
+
+  - name: identity
+    engine: postgresql
+    schema: *oltp_schema
+    queries: internal/modules/identity/store
+    gen:
+      go:
+        package: store
+        out: internal/modules/identity/store
+        sql_package: pgx/v5
+        emit_db_tags: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        emit_result_struct_pointers: true
+        emit_params_struct_pointers: true
+
+  - name: catalog
+    engine: postgresql
+    schema: *oltp_schema
+    queries: internal/modules/catalog/store
+    gen:
+      go:
+        <<: *go_options
+        out: internal/modules/catalog/store
+
+  - name: search
+    engine: postgresql
+    schema: *oltp_schema
+    queries: internal/modules/search/store
+    gen:
+      go:
+        <<: *go_options
+        out: internal/modules/search/store
+
+  - name: orders
+    engine: postgresql
+    schema: *oltp_schema
+    queries: internal/modules/orders/store
+    gen:
+      go:
+        <<: *go_options
+        out: internal/modules/orders/store
+
+  - name: billing
+    engine: postgresql
+    schema: *oltp_schema
+    queries: internal/modules/billing/store
+    gen:
+      go:
+        <<: *go_options
+        out: internal/modules/billing/store
+
+  - name: trust
+    engine: postgresql
+    schema: *oltp_schema
+    queries: internal/modules/trust/store
+    gen:
+      go:
+        <<: *go_options
+        out: internal/modules/trust/store
+
+  - name: analytics
+    engine: postgresql
+    schema:
+      - migrations/analytics/000001_create_analytics.up.sql
+    queries: internal/modules/operator/store
+    gen:
+      go:
+        package: store
+        out: internal/modules/operator/store
+        sql_package: pgx/v5
+        emit_db_tags: true
+        emit_json_tags: true
+        emit_empty_slices: true
+        emit_interface: false
+        emit_pointers_for_null_types: true
+        emit_result_struct_pointers: true
+        emit_params_struct_pointers: true
+        omit_unused_structs: true
