@@ -1,0 +1,31 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.go"
+      run: |
+        out=$(gofumpt -l {staged_files} 2>/dev/null); [ -z "$out" ] || { echo "$out"; exit 1; }
+    lint-changed:
+      run: |
+        if git rev-parse --verify --quiet origin/main >/dev/null; then
+          golangci-lint run --new-from-rev=origin/main --timeout=3m
+        else
+          golangci-lint run --timeout=3m
+        fi
+    todo-gate:
+      run: scripts/todo-gate.sh
+    migration-pairs:
+      run: scripts/migration-pairs.sh
+    banned-terms:
+      run: scripts/banned-terms.sh
+    no-env:
+      run: '! git diff --cached --name-only | grep -qE "(^|/)\.env$"'
+
+pre-push:
+  commands:
+    unit:
+      run: go test ./... -short -race -count=1
+    arch:
+      run: go test ./tests/arch/... -count=1
+    adr-trace:
+      run: python3 scripts/adr_trace.py

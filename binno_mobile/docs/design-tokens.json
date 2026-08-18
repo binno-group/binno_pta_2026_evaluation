@@ -1,0 +1,55 @@
+{
+  "border": {
+    "default": "#E2E8F0",
+    "strong": "#CBD5E1"
+  },
+  "brand": {
+    "accent": "#F25912",
+    "navy975": "#0B172A",
+    "navy100": "#E8EDF5",
+    "navy50": "#F3F6FA",
+    "navy700": "#2F4574",
+    "navy800": "#24365C",
+    "navy900": "#1B2A4A",
+    "navy950": "#101D33"
+  },
+  "radius": {
+    "lg": 20,
+    "hero": 36,
+    "md": 14,
+    "pill": 999,
+    "sm": 10,
+    "xl": 28
+  },
+  "spacing": {
+    "1": 4,
+    "2": 8,
+    "3": 12,
+    "4": 16,
+    "5": 20,
+    "6": 24,
+    "8": 32,
+    "10": 40,
+    "12": 48,
+    "16": 64
+  },
+  "status": {
+    "danger": "#DC2626",
+    "dangerSurface": "#FDEBEC",
+    "info": "#2563EB",
+    "success": "#16A34A",
+    "successSurface": "#E3F4E8",
+    "warning": "#D97706",
+    "warningSurface": "#FFF4DF"
+  },
+  "surface": {
+    "canvas": "#FFFFFF",
+    "muted": "#F1F5F9",
+    "subtle": "#F8FAFC"
+  },
+  "text": {
+    "primary": "#0F172A",
+    "secondary": "#64748B",
+    "tertiary": "#94A3B8"
+  }
+}

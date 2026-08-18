@@ -1,0 +1,55 @@
+schemas:
+  identity:
+    owner: identity
+    readers: []
+    description: >-
+      User accounts and refresh-token sessions. Nothing else reads them: a
+      module that needs to know who is calling gets the principal from the
+      validated JWT, never by joining against users.
+
+  location:
+    owner: location
+    readers:
+      - identity
+      - search
+    description: Owner accounts, trade complexes, blocks and stores.
+
+  catalog:
+    owner: catalog
+    readers:
+      - search
+    description: Product catalogue, seller offers and stock, delivery tariffs.
+
+  orders:
+    owner: orders
+    readers: []
+    description: >-
+      The order aggregate, its item snapshot, its event log and confirmation
+      tokens. Billing and trust used to read this schema directly; they now go
+      through orders.SummaryPort, which is why readers is empty.
+
+  billing:
+    owner: billing
+    readers: []
+    description: Invoices, PSP payments, refunds and the owner commission ledger.
+
+  trust:
+    owner: trust
+    readers: []
+    description: Binary, transaction-bound feedback on completed orders.
+
+  platform:
+    owner: platform
+    readers: []
+    description: >-
+      Shared infrastructure: the transactional outbox and mutation receipts.
+      Written only by internal/platform (outbox.Writer, dedup), never from a
+      module's own query files.
+
+  analytics:
+    owner: operator
+    readers: []
+    description: >-
+      The analytics read model. It lives in a separate database, is written only
+      by cmd/dispatcher through the analytics sink, and is read by the operator
+      module. No OLTP module may touch it, tests/arch enforces the Go side.

@@ -1,0 +1,6 @@
+services:
+  binno:
+    environment:
+      RATE_LIMIT_WINDOW: 1m
+      RATE_LIMIT_ANONYMOUS_BURST: "100000000"
+      RATE_LIMIT_AUTHENTICATED_BURST: "100000000"

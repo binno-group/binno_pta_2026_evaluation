@@ -1,0 +1,66 @@
+x-vm-c1: &vm-c1 "0-3"
+x-vm-c2: &vm-c2 "4,5"
+x-vm-c3: &vm-c3 "6,7"
+
+services:
+  nginx:
+    cpuset: *vm-c1
+    mem_limit: 128m
+
+  binno:
+    cpuset: *vm-c1
+    mem_limit: 1g
+    environment:
+      GOMEMLIMIT: 768MiB
+
+  dispatcher:
+    cpuset: *vm-c1
+    mem_limit: 256m
+    environment:
+      GOMEMLIMIT: 192MiB
+
+  postgres-oltp:
+    cpuset: *vm-c2
+    mem_limit: 2g
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=100
+      - -c
+      - effective_cache_size=1536MB
+
+  postgres-analytics:
+    cpuset: *vm-c3
+    mem_limit: 1g
+
+  clickhouse:
+    cpuset: *vm-c3
+    mem_limit: 2g
+
+  redis:
+    cpuset: *vm-c1
+    mem_limit: 512m
+    command:
+      - redis-server
+      - --maxmemory
+      - 384mb
+      - --maxmemory-policy
+      - noeviction
+
+  prometheus:
+    cpuset: *vm-c1
+    mem_limit: 512m
+
+  grafana:
+    cpuset: *vm-c1
+    mem_limit: 384m
+
+  loki:
+    cpuset: *vm-c1
+    mem_limit: 512m
+
+  tempo:
+    cpuset: *vm-c1
+    mem_limit: 512m

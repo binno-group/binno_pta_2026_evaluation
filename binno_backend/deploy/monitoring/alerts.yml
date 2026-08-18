@@ -1,0 +1,124 @@
+groups:
+  - name: binno-slo
+    rules:
+      - alert: BinnoHighErrorRate
+        expr: |
+          sum(rate(binno_http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(binno_http_requests_total[5m]))
+          > 0.005
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "BINNO API 5xx rate above the 99.5% SLO error budget"
+
+      - alert: BinnoOutboxBacklogGrowing
+        expr: binno_outbox_pending > 1000
+        for: 15m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Outbox dispatcher is falling behind (>1000 undispatched events)"
+
+      - alert: BinnoOutboxDeadLetters
+        expr: binno_outbox_dead_letters > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Outbox contains poison events; follow the analytics dispatcher runbook"
+
+      - alert: BinnoStockAdjustmentNoop
+        expr: increase(binno_stock_adjust_noop_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "A stock {{ $labels.op }} matched no offer row: reservation accounting drifted"
+          description: >-
+            The order state machine drives each release/consume exactly once, so
+            a zero-row adjustment is always an anomaly. The transition itself
+            was allowed to proceed (a cancellation must never be blocked), but
+            the offer's reserved_qty no longer matches the order's snapshot.
+            Find the order and offer in the accompanying error log line and
+            reconcile by hand before the drift compounds.
+
+      - alert: BinnoHighRequestLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(binno_http_request_duration_seconds_bucket[5m])) by (le, route))
+          > 2
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "p95 request latency above the 2s server timeout budget on {{ $labels.route }}"
+
+  - name: binno-saturation
+    rules:
+      - alert: BinnoDBPoolSaturated
+        expr: rate(binno_db_pool_acquire_wait_seconds_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Callers are queueing for a {{ $labels.pool }} connection ({{ $value | humanize }}s of wait per second)"
+          description: >-
+            Either the pool is too small for the offered concurrency, or queries
+            got slower and are holding connections longer. Check
+            binno_dependency_duration_seconds before enlarging the pool: a slower
+            query needs fixing, not more connections.
+
+      - alert: BinnoDBPoolExhausted
+        expr: |
+          binno_db_pool_acquired_connections / binno_db_pool_max_connections > 0.9
+        for: 15m
+        labels:
+          severity: warn
+        annotations:
+          summary: "{{ $labels.pool }} pool sustained above 90% of its connection ceiling"
+          description: >-
+            This is one of the documented triggers for revisiting a connection
+            pooler. It was NOT true at any replica count during capacity testing
+            (peak 66 of 100 server-side while the service delivered 0% success),
+            so treat it as new information rather than confirmation.
+
+      - alert: BinnoSheddingLoad
+        expr: rate(binno_http_shed_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Admission control is shedding {{ $value | humanize }} req/s"
+          description: >-
+            The instance is at HTTP_MAX_IN_FLIGHT and refusing work with 503 +
+            Retry-After. This is correct behaviour under overload, not a bug,
+            but sustained shedding means offered load exceeds capacity. Compare
+            binno_http_in_flight_requests against binno_http_in_flight_limit.
+
+      - alert: BinnoDependencySlow
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(binno_dependency_duration_seconds_bucket[5m])) by (le, dependency))
+          > 0.1
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "p95 latency to {{ $labels.dependency }} above 100ms"
+          description: >-
+            Every dependency call sits on the request critical path, so this
+            lands directly in caller latency without necessarily producing a
+            single error. Readiness will stay green throughout.
+
+      - alert: BinnoRedisPoolTimeouts
+        expr: rate(binno_redis_pool_timeout_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Redis connection pool is handing out timeouts"
+          description: >-
+            Callers waited PoolTimeout for a free connection and gave up. Redis
+            was measured at 0.24% of capacity, so this points at a pool sized
+            below concurrency, or at Redis itself being slow.

@@ -1,0 +1,1341 @@
+openapi: 3.1.0
+info:
+  title: BINNO Platform API
+  version: 1.1.0
+  description: |
+    BINNO MVP contract-first API. All IDs are UUID v7, all timestamps are
+    UTC, all money is integer tiyin. Mutations require an Idempotency-Key.
+servers:
+  - url: https://api.binno.uz/api/v1
+security:
+  - bearerAuth: []
+tags:
+  - { name: search }
+  - { name: catalog }
+  - { name: offers }
+  - { name: orders }
+  - { name: billing }
+  - { name: trust }
+  - { name: operator }
+
+paths:
+  /auth/otp/request:
+    post:
+      summary: Send a one-time code by SMS
+      description: >-
+        Answers the same way whether or not the number has an account.
+        Distinguishing them would turn this into a membership oracle for every
+        phone number in the country. Registration happens on first successful
+        verification.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone:
+                  type: string
+                  description: >-
+                    Uzbek number in any common form. Normalised to 998XXXXXXXXX
+                    before storage, so +998 90 123 45 67 and 901234567 are the
+                    same account.
+                  example: "+998901234567"
+      responses:
+        '202':
+          description: >-
+            Handed to the SMS gateway. Not 200, whether it reaches the handset
+            is not something this response can honestly claim.
+        '422':
+          description: >-
+            The number is not a valid Uzbek number, or the SMS gateway will
+            never deliver to it. Both are the caller's to fix and neither
+            improves on a retry, so they answer alike; a gateway that is merely
+            unavailable is a 5xx instead.
+        '429':
+          description: A code was sent recently; Retry-After gives the wait.
+          headers:
+            Retry-After: { schema: { type: integer } }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /auth/otp/verify:
+    post:
+      summary: Exchange a code for a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone: { type: string, example: "+998901234567" }
+                code:  { type: string, example: "482913" }
+      responses:
+        '200':
+          description: >-
+            Session issued. First successful verification creates the account,
+            and is_new_user says whether this call was that one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /auth/refresh:
+    post:
+      summary: Rotate a session
+      description: >-
+        Every refresh issues a new pair and revokes the presented token. A token
+        replayed after rotation is treated as theft and ends every session for
+        that user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: New pair issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /auth/logout:
+    post:
+      summary: End one session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '204':
+          description: >-
+            The session will not work. An unknown, expired or already-revoked
+            token also returns 204: the caller's intent is satisfied either way,
+            and reporting the difference would let an attacker probe for valid
+            tokens.
+        default: { $ref: '#/components/responses/Problem' }
+
+  /sellers/register:
+    post:
+      summary: Apply to sell, identified by STIR
+      description: >-
+        Any authenticated user may apply; the seller role is the result of an
+        approved application, not a precondition for making one. The account is
+        created pending and confers no selling capability until an operator
+        approves it.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tin, legal_name]
+              properties:
+                tin:
+                  type: string
+                  pattern: '^[0-9]{9}$'
+                  description: STIR, nine digits.
+                legal_name:   { type: string }
+                legal_form:   { type: string }
+                bank_account: { type: string }
+                mfo:          { type: string }
+      responses:
+        '201':
+          description: Application accepted, pending operator approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SellerAccount' }
+        '409':
+          description: This account already applied, or the STIR is registered elsewhere.
+        default: { $ref: '#/components/responses/Problem' }
+
+  /sellers/me:
+    get:
+      summary: The caller's seller account
+      responses:
+        '200':
+          description: Seller account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SellerAccount' }
+        '404':
+          description: The caller has no seller account.
+        default: { $ref: '#/components/responses/Problem' }
+
+  /search:
+    get:
+      tags: [search]
+      summary: Search anchored at the delivery address
+      operationId: searchOffers
+      security: []
+      parameters:
+        - { name: lat, in: query, required: true, schema: { type: number, format: double } }
+        - { name: lng, in: query, required: true, schema: { type: number, format: double } }
+        - { name: district_id, in: query, required: true, schema: { type: integer } }
+        - { name: product_id, in: query, schema: { type: string, format: uuid } }
+        - name: radius_m
+          in: query
+          description: |
+            Search radius in metres. When omitted, the search starts at 5000
+            and, if nothing is found, widens in 5000-metre steps up to 20000
+            (5, 10, 15, 20 km). An explicitly given radius is never widened;
+            radius_meters in the response echoes exactly that value. If
+            nothing is found even at 20 km, search_exhausted=true is
+            returned, the cue to ask the user whether to keep going. The
+            radius is a mandatory bound: without it every request would have
+            to sort the whole catalogue by distance and the GIST index on
+            stores.location would go unused. An out-of-range value is
+            rejected rather than clamped; otherwise an empty result would be
+            ambiguous.
+          schema: { type: integer, minimum: 100, maximum: 100000, default: 5000 }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Store-level results, one best offer per owner
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OfferPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /complexes/{id}/aggregate:
+    get:
+      tags: [search]
+      summary: A trading complex's aggregation by product and block
+      operationId: getComplexAggregate
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { name: product_id, in: query, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Aggregation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComplexAggregate' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /catalog/requests:
+    post:
+      tags: [catalog]
+      summary: Ask for a product to be added to the catalogue
+      operationId: createCatalogRequest
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CatalogRequestInput' }
+      responses:
+        '201':
+          description: Request created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedResource' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /catalog/requests/{id}:
+    patch:
+      tags: [operator]
+      summary: Close a catalogue request as added or rejected
+      operationId: resolveCatalogRequest
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CatalogResolution' }
+      responses:
+        '200': { description: Request closed }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /offers:
+    post:
+      tags: [offers]
+      summary: Create a store offer for a master-catalogue product
+      operationId: createOffer
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OfferInput' }
+      responses:
+        '201':
+          description: Offer created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedResource' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /offers/{id}:
+    patch:
+      tags: [offers]
+      summary: Update price, stock, or visibility (pause/republish)
+      operationId: updateOffer
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OfferUpdate' }
+      responses:
+        '200': { description: Offer updated }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders:
+    get:
+      tags: [orders]
+      summary: The buyer's own orders, newest first
+      operationId: listMyOrders
+      parameters:
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Keyset page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [orders]
+      summary: Create an order; the response carries no ETA or tracking fields
+      operationId: createOrder
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCreate' }
+      responses:
+        '201':
+          description: Order in the created state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderCreated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: One order's detail, for its buyer or its selling store
+      operationId: getOrder
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+      responses:
+        '200':
+          description: The order and its line items
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderDetail' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /stores/{id}/orders:
+    get:
+      tags: [orders]
+      summary: A store's open-orders queue, newest first
+      operationId: listStoreOrders
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Keyset page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/supplier-confirm:
+    post:
+      tags: [orders]
+      summary: The seller confirms the order and the declared stock
+      operationId: confirmOrderBySupplier
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { description: Order accepted }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/confirm:
+    post:
+      tags: [orders]
+      summary: Seller confirmation via a single-use SMS token
+      operationId: confirmOrderByToken
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { name: token, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Order accepted }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/decline:
+    post:
+      tags: [orders]
+      summary: Decline the order and move it to buyer_decision_pending
+      operationId: declineOrder
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { description: Order declined }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/alternatives:
+    get:
+      tags: [orders]
+      summary: Alternative offers excluding the stores that declined
+      operationId: getOrderAlternatives
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+      responses:
+        '200':
+          description: RankExcluding result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OfferPage' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/cancel:
+    post:
+      tags: [orders]
+      summary: Cancel the order
+      operationId: cancelOrder
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Order cancelled }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/payment-invoice:
+    get:
+      tags: [billing]
+      summary: The immutable payment invoice PDF
+      operationId: getPaymentInvoice
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+      responses:
+        '200':
+          description: PDF
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/refund:
+    post:
+      tags: [billing]
+      summary: The seller submits refund evidence
+      operationId: submitRefundEvidence
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefundEvidence' }
+      responses:
+        '200': { description: Evidence submitted }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/pickup-confirm:
+    post:
+      tags: [orders]
+      summary: Confirm pickup with a code or a signature
+      operationId: confirmPickup
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PickupConfirmation' }
+      responses:
+        '200': { description: Pickup confirmed }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/payment-receipt:
+    post:
+      tags: [orders]
+      summary: Submit the bank payment receipt (buyer)
+      description: >-
+        The receipt is accepted as an object-storage link, not as a file. The
+        API never takes file bytes, which is why there is no upload path, size
+        limit, or MIME check here.
+      operationId: submitPaymentReceipt
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentReceiptInput' }
+      responses:
+        '200': { description: Receipt accepted, the seller will review it }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/payment-confirm:
+    post:
+      tags: [orders]
+      summary: Confirm the payment reached the account (seller)
+      operationId: confirmPayment
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { description: Payment confirmed }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/payment-reject:
+    post:
+      tags: [orders]
+      summary: Reject the receipt (seller)
+      description: >-
+        The order returns to awaiting_payment and the reservation is kept: the
+        usual cause is the buyer attaching the wrong file.
+      operationId: rejectPayment
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentRejectInput' }
+      responses:
+        '200': { description: Receipt rejected }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/preparing:
+    post:
+      tags: [orders]
+      summary: Preparation started (seller)
+      operationId: startPreparing
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { description: Order is being prepared }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/ready:
+    post:
+      tags: [orders]
+      summary: Goods ready for handover (seller)
+      operationId: markReady
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { description: Order ready }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/delivery-confirm:
+    post:
+      tags: [orders]
+      summary: Confirm delivery (seller)
+      description: >-
+        Closes the order and accrues the commission to the owner account, both
+        in one transaction.
+      operationId: confirmDelivery
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { description: Delivered and the order closed }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/refund-request:
+    post:
+      tags: [orders]
+      summary: Open a refund on a paid order (operator)
+      description: >-
+        Moves the order to refund_requested, opens a refund record in the
+        billing schema, and returns the reserved stock to the catalogue, all in
+        one transaction.
+      operationId: requestRefund
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        '200': { description: Refund opened }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/refund-confirm:
+    post:
+      tags: [orders]
+      summary: The buyer confirms the money came back
+      description: >-
+        Moves the order to refunded, closes the open refund, and reverses the
+        settled payment in the ledger.
+      operationId: confirmRefund
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { description: Refund completed }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/feedback:
+    post:
+      tags: [trust]
+      summary: Binary feedback on a closed order
+      operationId: createOrderFeedback
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderFeedbackInput' }
+      responses:
+        '201': { description: Feedback recorded }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /orders/urgent:
+    post:
+      tags: [orders]
+      summary: Urgent broadcast with a 7 km radius and zone-tariff filter
+      operationId: createUrgentOrder
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCreate' }
+      responses:
+        '201':
+          description: Urgent order created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderCreated' }
+        '404':
+          description: Feature flag disabled
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /owners/{id}/commission-invoices:
+    get:
+      tags: [billing]
+      summary: Owner-level weekly commission invoices
+      operationId: listCommissionInvoices
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Weekly invoices
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CommissionInvoice' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /operator/queues/{type}:
+    get:
+      tags: [operator]
+      summary: The operator queue with SLA countdowns
+      operationId: getOperatorQueue
+      parameters:
+        - { $ref: '#/components/parameters/QueueType' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: The queue
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorQueue' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /operator/queues/{type}/{id}/resolve:
+    post:
+      tags: [operator]
+      summary: Close an operator queue item with an outcome
+      operationId: resolveOperatorQueueItem
+      parameters:
+        - { $ref: '#/components/parameters/QueueType' }
+        - { $ref: '#/components/parameters/PathId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, minLength: 1, maxLength: 100 }
+                note: { type: string, maxLength: 1000 }
+      responses:
+        '200': { description: Queue item closed }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        HS256 JWT. Required claims:
+          * `sub`: the user's UUID
+          * `exp`: mandatory; a token without exp is rejected outright
+          * `roles`: array of `buyer` | `seller` | `operator`;
+            unknown roles are dropped
+
+        Authentication (is the token genuine) and authorisation (is this
+        resource yours) are separate concerns. A genuine token is not enough:
+        every endpoint checks the resource's owner on its own. Requesting
+        another user's order or owner account answers 403, or 404 where
+        existence must not be disclosed.
+
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Server-issued opaque composite keyset cursor; the client sends it back without parsing it
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 128 }
+      description: |
+        Retry-safe mutation key with a 24-hour window.
+
+        Same key + same body -> the first response is replayed verbatim
+        (`Idempotency-Replayed: true`).
+        Same key + a DIFFERENT body -> 422, `type` =
+        `https://binno.uz/problems/idempotency-key-reuse`. The mutation does
+        not run. Use a fresh key for every logically distinct request.
+    QueueType:
+      name: type
+      in: path
+      required: true
+      schema:
+        type: string
+        enum:
+          - payment_review
+          - refund_overdue
+          - sla_escalation
+          - catalog_request
+          - confirmation_chase
+
+  responses:
+    Problem:
+      description: RFC 7807 error
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Illegal state transition or duplicate action
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Validation:
+      description: Validation error
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Token missing, malformed, or expired
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: |
+        The token is genuine but the resource belongs to another account.
+        Where disclosing existence is a risk (for example someone else's
+        order), 404 is returned instead.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: |
+        The caller's request budget is exhausted. Authenticated callers are
+        counted per principal, anonymous callers per IP, and the anonymous
+        budget is smaller.
+      headers:
+        Retry-After:
+          description: Seconds until the next window
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    Unavailable:
+      description: |
+        The request did not run because the database was busy; the request
+        itself is fine. The transaction rolled back cleanly, meaning nothing
+        was written, so resubmitting with the same Idempotency-Key is safe.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+
+    Money:
+      type: integer
+      format: int64
+      minimum: 0
+      description: UZS tiyin
+
+    Quantity:
+      type: string
+      pattern: '^[0-9]+(?:\.[0-9]+)?$'
+      description: Decimal quantity carried as a JSON string
+
+    CreatedResource:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, format: uuid }
+
+    CatalogRequestInput:
+      type: object
+      required: [store_id, name, unit]
+      properties:
+        store_id: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        unit: { type: string, minLength: 1, maxLength: 30 }
+        description: { type: string, maxLength: 2000 }
+        image_url: { type: string, format: uri }
+
+    CatalogResolution:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [added, rejected] }
+        product_id: { type: string, format: uuid }
+        reject_reason: { type: string, maxLength: 1000 }
+
+    OfferInput:
+      type: object
+      required: [store_id, product_id, price, declared_qty]
+      properties:
+        store_id: { type: string, format: uuid }
+        product_id: { type: string, format: uuid }
+        price: { $ref: '#/components/schemas/Money' }
+        declared_qty: { $ref: '#/components/schemas/Quantity' }
+
+    OfferUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        price: { $ref: '#/components/schemas/Money' }
+        declared_qty: { $ref: '#/components/schemas/Quantity' }
+        status:
+          type: string
+          enum: [published, hidden]
+          description: >-
+            Pause the offer (hidden) or republish it (published). An archived
+            offer cannot be brought back from here.
+
+    Offer:
+      type: object
+      required: [id, store_id, product_id, price, declared_qty, freshness_at]
+      properties:
+        id: { type: string, format: uuid }
+        store_id: { type: string, format: uuid }
+        product_id: { type: string, format: uuid }
+        price: { $ref: '#/components/schemas/Money' }
+        declared_qty: { $ref: '#/components/schemas/Quantity' }
+        freshness_at: { type: string, format: date-time }
+        freshness_label: { type: string, enum: [today, stale_warning, none] }
+        distance_meters: { type: integer, minimum: 0 }
+        other_owner_store_count: { type: integer, minimum: 0 }
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: >-
+            Short-lived HS256 JWT carrying sub and roles. Stateless, so nothing
+            can revoke it before it expires, which is why it is short.
+        refresh_token:
+          type: string
+          description: >-
+            Opaque, long-lived, single-use. Stored hashed, so it can be revoked
+            and so a database dump yields no usable session.
+        token_type: { type: string, enum: [Bearer] }
+        expires_in:
+          type: integer
+          description: Access token lifetime in seconds.
+
+    Session:
+      description: >-
+        A verified session: the token pair plus the one thing only verification
+        can report. Refresh returns a bare TokenPair, because a rotation has no
+        opinion on how the account began.
+      allOf:
+        - $ref: '#/components/schemas/TokenPair'
+        - type: object
+          required: [is_new_user]
+          properties:
+            is_new_user:
+              type: boolean
+              description: >-
+                True when this verification created the account, so the client
+                can route a first-time user into onboarding rather than to the
+                feed. Answered here and not at /auth/otp/request on purpose: the
+                same fact, told before a code is verified, is a membership
+                oracle for every phone number in the country. Told to someone
+                who has just proved possession of the handset, it discloses
+                nothing they do not already know.
+
+    SellerAccount:
+      type: object
+      required: [owner_id, status]
+      properties:
+        owner_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, active, suspended]
+          description: >-
+            Only an active account carries the seller role. The role is derived
+            from this field at token issue, never stored on the user, so
+            withdrawing it is one update rather than two writes that can diverge.
+
+    OfferPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Offer' }
+        next_cursor: { type: [string, 'null'] }
+        radius_meters:
+          type: integer
+          minimum: 0
+          description: >-
+            The radius that actually produced these results, in metres. It is not
+            always the radius requested: when the caller names no radius, the
+            search starts at 5 km and widens by 5 km up to three times (5, 10, 15,
+            20) until it finds offers. Show this rather than the default, so
+            "within 15 km" is true. An explicitly requested radius is never
+            widened and is echoed back unchanged.
+        search_exhausted:
+          type: boolean
+          description: >-
+            True when automatic expansion reached 20 km and still found nothing.
+            This is the cue to ask the buyer rather than show a dead end, "no
+            store network found within {radius_meters}; keep searching?", and to
+            distinguish that from "no offers matched your product filter", where
+            it stays false. To continue, re-request with an explicit, wider
+            radius_m (up to 100 km); an explicit radius is honoured exactly and
+            never expanded, so this flag is always false for such a request.
+
+    ComplexAggregate:
+      type: object
+      required: [complex_id, complex_name, offers]
+      properties:
+        complex_id: { type: string, format: uuid }
+        complex_name: { type: string }
+        pickup_point:
+          type: [object, 'null']
+          properties:
+            lat: { type: number, format: double }
+            lng: { type: number, format: double }
+        offers: { $ref: '#/components/schemas/OfferPage' }
+
+    OrderItemInput:
+      type: object
+      required: [product_id, qty]
+      properties:
+        product_id: { type: string, format: uuid }
+        qty: { $ref: '#/components/schemas/Quantity' }
+
+    OrderCreate:
+      type: object
+      required:
+        - store_id
+        - buyer_type
+        - fulfillment
+        - district_id
+        - items
+      properties:
+        store_id: { type: string, format: uuid }
+        buyer_type: { type: string, enum: [individual, legal_entity] }
+        buyer_tin: { type: string, pattern: '^[0-9]{9}$' }
+        fulfillment: { type: string, enum: [delivery, pickup] }
+        district_id: { type: integer }
+        dropoff:
+          type: object
+          required: [lat, lng, address]
+          properties:
+            lat: { type: number, format: double }
+            lng: { type: number, format: double }
+            address: { type: string, minLength: 1 }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/OrderItemInput' }
+
+    OrderCreated:
+      type: object
+      required:
+        - order_id
+        - status
+        - goods_amount
+        - delivery_fee
+        - total_amount
+        - supplier_confirmation_deadline
+      properties:
+        order_id: { type: string, format: uuid }
+        status: { type: string, const: created }
+        goods_amount: { $ref: '#/components/schemas/Money' }
+        delivery_fee: { $ref: '#/components/schemas/Money' }
+        total_amount: { $ref: '#/components/schemas/Money' }
+        supplier_confirmation_deadline: { type: string, format: date-time }
+
+    OrderView:
+      type: object
+      required:
+        - order_id
+        - store_id
+        - status
+        - buyer_type
+        - fulfillment
+        - urgent
+        - goods_amount
+        - delivery_fee
+        - total_amount
+        - supplier_confirmation_deadline
+        - created_at
+      properties:
+        order_id: { type: string, format: uuid }
+        store_id: { type: string, format: uuid }
+        status: { type: string }
+        buyer_type: { type: string, enum: [individual, legal_entity] }
+        fulfillment: { type: string, enum: [delivery, pickup] }
+        urgent: { type: boolean }
+        goods_amount: { $ref: '#/components/schemas/Money' }
+        delivery_fee: { $ref: '#/components/schemas/Money' }
+        total_amount: { $ref: '#/components/schemas/Money' }
+        supplier_confirmation_deadline: { type: string, format: date-time }
+        payment_due_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time }
+
+    OrderDetail:
+      allOf:
+        - { $ref: '#/components/schemas/OrderView' }
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                required: [product_id, qty, unit_price, line_amount]
+                properties:
+                  product_id: { type: string, format: uuid }
+                  qty: { type: string }
+                  unit_price: { $ref: '#/components/schemas/Money' }
+                  line_amount: { $ref: '#/components/schemas/Money' }
+
+    OrderPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderView' }
+        next_cursor: { type: [string, 'null'] }
+
+    RefundEvidence:
+      type: object
+      required: [amount, evidence_url]
+      properties:
+        amount: { $ref: '#/components/schemas/Money' }
+        evidence_url: { type: string, format: uri }
+
+    PickupConfirmation:
+      type: object
+      oneOf:
+        - required: [code]
+        - required: [signature_url]
+      properties:
+        code: { type: string, minLength: 4, maxLength: 12 }
+        signature_url: { type: string, format: uri }
+
+    PaymentReceiptInput:
+      type: object
+      required: [receipt_url]
+      properties:
+        receipt_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Object-storage link to the receipt (http/https)
+
+    PaymentRejectInput:
+      type: object
+      properties:
+        reason: { type: string, maxLength: 500 }
+
+    OrderFeedbackInput:
+      type: object
+      required: [had_problem, channel]
+      properties:
+        had_problem: { type: boolean }
+        tags:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: [late, qty_short, quality, price_mismatch, no_response]
+        comment: { type: string, maxLength: 2000 }
+        channel: { type: string, enum: [push, sms, app] }
+
+    CommissionInvoice:
+      type: object
+      required:
+        - id
+        - period_start
+        - period_end
+        - accrued_amount
+        - discount_amount
+        - amount
+        - due_at
+        - status
+      properties:
+        id: { type: string, format: uuid }
+        period_start: { type: string, format: date }
+        period_end: { type: string, format: date }
+        accrued_amount: { $ref: '#/components/schemas/Money' }
+        discount_amount: { $ref: '#/components/schemas/Money' }
+        amount: { $ref: '#/components/schemas/Money' }
+        due_at: { type: string, format: date-time }
+        status: { type: string, enum: [issued, paid, overdue] }
+
+    OperatorQueue:
+      type: object
+      required: [type, items]
+      properties:
+        type:
+          type: string
+          enum:
+            - payment_review
+            - refund_overdue
+            - sla_escalation
+            - catalog_request
+            - confirmation_chase
+        items:
+          type: array
+          items:
+            type: object
+            required: [id, ref_id, opened_at, due_at]
+            properties:
+              id: { type: string, format: uuid }
+              ref_id: { type: string, format: uuid }
+              opened_at: { type: string, format: date-time }
+              due_at: { type: string, format: date-time }
+        next_cursor: { type: [string, 'null'] }

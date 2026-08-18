@@ -1,0 +1,869 @@
+openapi: 3.1.0
+info:
+  title: BINNO Platform API
+  version: 1.1.0
+  description: |
+    BINNO — API contract for the B2B construction transaction platform.
+    In sync with Technical Specification v1.1 (module references appear in
+    each endpoint description).
+    Conventions: all IDs are UUID v7; timestamps are UTC ISO 8601; money is
+    integer tiyin (UZS); errors are RFC 7807 application/problem+json;
+    prefix /api/v1.
+    Mutating endpoints support the Idempotency-Key header.
+  contact:
+    name: Solution Labs MChJ
+servers:
+  - url: https://api.binno.uz/api/v1
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+    description: Modules 01-02 — OTP, tokens, sessions
+  - name: catalog
+    description: Modules 05-06 — products and categories
+  - name: search
+    description: Module 07 — search
+  - name: orders
+    description: Modules 08-09 — orders and negotiation
+  - name: billing
+    description: Modules 10, 13-15 — invoices, commission, limits, balance
+  - name: payment
+    description: Module 11 — payment confirmation
+  - name: disputes
+    description: Module 12 — disputes
+  - name: driver
+    description: Modules 16-18 — driver (TG mini-app)
+  - name: trust
+    description: Modules 20-21 — rating and verification
+
+paths:
+  /auth/otp/request:
+    post:
+      tags: [auth]
+      summary: Request an OTP (BR-01.2, BR-01.3)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, purpose]
+              properties:
+                phone: { type: string, pattern: '^\+998\d{9}$', example: '+998901234567' }
+                purpose: { type: string, enum: [register, login] }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: string, format: uuid }
+                  expires_in: { type: integer, example: 120 }
+                  retry_after: { type: integer, example: 60 }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/otp/verify:
+    post:
+      tags: [auth]
+      summary: Verify an OTP (BR-01.4)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, code]
+              properties:
+                request_id: { type: string, format: uuid }
+                code: { type: string, pattern: '^\d{6}$' }
+      responses:
+        '200':
+          description: Login — tokens; register — registration_token
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/TokenPair'
+                  - type: object
+                    properties:
+                      registration_token: { type: string }
+        '400': { $ref: '#/components/responses/InvalidCode' }
+        '410': { $ref: '#/components/responses/Expired' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh tokens — rotation is mandatory (BR-02.3)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403':
+          description: token_reuse_detected — the token family was revoked
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /categories/tree:
+    get:
+      tags: [catalog]
+      summary: Category tree (max 3 levels, BR-06.1; cached for 1 hour)
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Category' }
+
+  /supplier/products:
+    post:
+      tags: [catalog]
+      summary: Create a product (draft) — BR-05.1
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product_id: { type: string, format: uuid }
+                  status: { type: string, example: draft }
+        '422': { $ref: '#/components/responses/Validation' }
+    get:
+      tags: [catalog]
+      summary: Supplier product list
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [draft, published, archived] } }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductPage' }
+
+  /supplier/products/{id}/publish:
+    post:
+      tags: [catalog]
+      summary: Publish — verified suppliers only (BR-04.5, BR-05.2)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      responses:
+        '200': { description: Published }
+        '403':
+          description: supplier_not_verified
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /supplier/products/{id}/archive:
+    post:
+      tags: [catalog]
+      summary: Archive (no delete — BR-05.7)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      responses:
+        '200': { description: Archived }
+
+  /search/products:
+    get:
+      tags: [search]
+      summary: Search — FTS+trigram, p95<300ms (BR-07)
+      security: []
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: category_id, in: query, schema: { type: integer } }
+        - { name: price_min, in: query, schema: { type: integer, description: tiyin } }
+        - { name: price_max, in: query, schema: { type: integer } }
+        - { name: region_id, in: query, schema: { type: integer } }
+        - { name: weight_class, in: query, schema: { type: string, enum: [light, heavy, fragile] } }
+        - { name: min_rating, in: query, schema: { type: number } }
+        - { name: sort, in: query, schema: { type: string, enum: [relevance, price_asc, price_desc, rating_desc, newest] } }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { name: limit, in: query, schema: { type: integer, maximum: 40, default: 20 } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductCard' }
+                  next_cursor: { type: string, nullable: true }
+                  total_estimate: { type: integer }
+
+  /orders:
+    post:
+      tags: [orders]
+      summary: Create an order (BR-08.8, BR-08.9)
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCreate' }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order_id: { type: string, format: uuid }
+                  status: { type: string, example: created }
+                  price_summary: { $ref: '#/components/schemas/PriceSummary' }
+    get:
+      tags: [orders]
+      summary: List orders (by role)
+      parameters:
+        - { name: role, in: query, schema: { type: string, enum: [buyer, supplier] } }
+        - { name: status, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/OrderSummary' }
+                  next_cursor: { type: string, nullable: true }
+
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: Full order state + timeline (BR-08.2)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderDetail' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /orders/{id}/cancel:
+    post:
+      tags: [orders]
+      summary: 'Buyer cancel — BR-08.10: unrestricted in created; in accepted only until payment.confirmed; after that only a dispute'
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Cancelled }
+        '409':
+          description: invalid_transition (for example after payment.confirmed)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /supplier/orders/{id}/accept:
+    post:
+      tags: [orders]
+      summary: Accept — the final price freezes (BR-08.4); credit-limit check (BR-14.2)
+      parameters: [ { $ref: '#/components/parameters/PathId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [final_items]
+              properties:
+                final_items:
+                  type: array
+                  items:
+                    type: object
+                    required: [product_id, qty, unit_price]
+                    properties:
+                      product_id: { type: string, format: uuid }
+                      qty: { type: number }
+                      unit_price: { type: integer, description: tiyin }
+                prep_time_estimate: { type: integer, description: days }
+      responses:
+        '200': { description: Accepted — invoice generation starts }
+        '403':
+          description: credit_limit_reached (BR-14.2, fail-closed)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /supplier/orders/{id}/reject:
+    post:
+      tags: [orders]
+      summary: Reject (a reason is mandatory)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200': { description: Rejected }
+
+  /supplier/orders/{id}/ready:
+    post:
+      tags: [orders]
+      summary: Ready — only after payment.confirmed (AC-11.4)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      responses:
+        '200': { description: ready_for_pickup — logistics starts }
+        '409':
+          description: payment_not_confirmed
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /supplier/orders/{id}/proposals:
+    post:
+      tags: [orders]
+      summary: Price proposal — max 3 rounds, 24h validity (BR-09.2)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProposalInput' }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  proposal_id: { type: string, format: uuid }
+                  round: { type: integer }
+                  expires_at: { type: string, format: date-time }
+        '409':
+          description: rounds_exhausted or negotiation_not_applicable
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /orders/{id}/proposals/{pid}/accept:
+    post:
+      tags: [orders]
+      summary: Accept the proposal — the order becomes accepted (BR-09.3)
+      parameters:
+        - { $ref: '#/components/parameters/PathId' }
+        - { name: pid, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Accepted — the price is frozen }
+        '410': { $ref: '#/components/responses/Expired' }
+
+  /orders/{id}/invoice:
+    get:
+      tags: [billing]
+      summary: Invoice — BIN-YYYYMM-NNNNN, valid for 5 business days (BR-10.2, BR-10.4)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+
+  /orders/{id}/payment/mark-paid:
+    post:
+      tags: [payment]
+      summary: Buyer marks payment + optional receipt (BR-11.1)
+      parameters: [ { $ref: '#/components/parameters/PathId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                receipt_photo: { type: string, description: 'uploaded file URL/id' }
+      responses:
+        '200': { description: Marked — awaiting supplier confirmation }
+
+  /supplier/orders/{id}/payment/confirm:
+    post:
+      tags: [payment]
+      summary: Money arrived — the order moves to preparing (BR-11.1)
+      parameters: [ { $ref: '#/components/parameters/PathId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses:
+        '200': { description: Confirmed }
+
+  /supplier/orders/{id}/payment/deny:
+    post:
+      tags: [payment]
+      summary: Money did not arrive — automatic dispute (BR-11.3)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [note]
+              properties:
+                note: { type: string }
+      responses:
+        '200': { description: Order disputed }
+
+  /orders/{id}/disputes:
+    post:
+      tags: [disputes]
+      summary: Open a dispute — 48h window (BR-12.1), max 10 photos
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, statement]
+              properties:
+                type: { type: string, enum: [payment_not_received, goods_damaged, wrong_items, not_delivered, quality_claim, other] }
+                statement: { type: string }
+                photos: { type: array, maxItems: 10, items: { type: string } }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dispute_id: { type: string, format: uuid }
+        '409':
+          description: dispute_window_closed
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /supplier/billing/summary:
+    get:
+      tags: [billing]
+      summary: Billing summary (BR-13, BR-14.3)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accrued_total: { type: integer }
+                  paid_total: { type: integer }
+                  outstanding: { type: integer }
+                  credit_limit: { type: integer }
+                  utilization_pct: { type: number }
+                  blocked: { type: boolean }
+
+  /supplier/billing/payment-intent:
+    post:
+      tags: [billing]
+      summary: Commission payment details + reference code (BR-14.4)
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  amount: { type: integer }
+                  binno_requisites: { type: object }
+                  reference_code: { type: string }
+
+  /driver/offers:
+    get:
+      tags: [driver]
+      summary: Active offers — classic + urgent (BR-17.3, BR-17.4)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DriverOffer' }
+
+  /driver/offers/{id}/accept:
+    post:
+      tags: [driver]
+      summary: Accept an offer — atomic, first-accept-wins (AC-17.2)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      responses:
+        '200': { description: Order assigned }
+        '409':
+          description: already_taken
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /driver/orders/{id}/delivered:
+    post:
+      tags: [driver]
+      summary: Delivered — 1-3 photos mandatory (BR-18.3)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [photos, location]
+              properties:
+                photos: { type: array, minItems: 1, maxItems: 3, items: { type: string, format: binary } }
+                location: { $ref: '#/components/schemas/GeoPoint' }
+      responses:
+        '200': { description: delivered — the 48h objection window started }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /orders/{id}/ratings:
+    post:
+      tags: [trust]
+      summary: Rating — closed orders only, 14-day window (BR-20.1)
+      parameters: [ { $ref: '#/components/parameters/PathId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target, score]
+              properties:
+                target: { type: string, enum: [supplier, driver, buyer] }
+                score: { type: integer, minimum: 1, maximum: 5 }
+                comment: { type: string, maxLength: 500 }
+                reason_category: { type: string, enum: [sifat, muddat, muomala, narx], description: 'mandatory for scores 1-2 (BR-20.3)' }
+      responses:
+        '201': { description: Rating recorded }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Expired' }
+
+  /verify/{supplier_id}:
+    get:
+      tags: [trust]
+      summary: Public verification page — no auth required (BR-21.4)
+      security: []
+      parameters:
+        - { name: supplier_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  legal_name: { type: string }
+                  stir_masked: { type: string, example: '3130****34' }
+                  level: { type: string, enum: [basic, advanced] }
+                  verified_at: { type: string, format: date-time }
+                  valid_until: { type: string, format: date-time }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access JWT HS256, TTL 15 minutes (BR-02.1)
+
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Keyset pagination cursor (BR-07.4)
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string, format: uuid }
+      description: For retry-safe mutations; response cached for 24 hours (Redis)
+
+  responses:
+    Problem:
+      description: RFC 7807 error
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: rate_limited (BR-01.3)
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Problem'
+              - type: object
+                properties:
+                  retry_after: { type: integer }
+    InvalidCode:
+      description: invalid_code + attempts left
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Problem'
+              - type: object
+                properties:
+                  attempts_left: { type: integer }
+    Expired:
+      description: Expired (OTP / proposal / rating window)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: 409 — invalid_transition / already_rated / rounds_exhausted, etc.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Validation:
+      description: 422 — field validation errors
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Problem'
+              - type: object
+                properties:
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        field: { type: string }
+                        message: { type: string }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807
+      properties:
+        type: { type: string, example: invalid_transition }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+
+    TokenPair:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        user: { $ref: '#/components/schemas/User' }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        roles: { type: array, items: { type: string } }
+
+    Money:
+      type: integer
+      format: int64
+      description: Integer tiyin (UZS). Floats are forbidden.
+
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat: { type: number }
+        lng: { type: number }
+
+    Category:
+      type: object
+      properties:
+        id: { type: integer }
+        parent_id: { type: integer, nullable: true }
+        name_uz: { type: string }
+        name_ru: { type: string }
+        slug: { type: string }
+        children: { type: array, items: { $ref: '#/components/schemas/Category' } }
+
+    ProductInput:
+      type: object
+      required: [title, category_id, price_model, unit, weight_class]
+      properties:
+        title: { type: string, minLength: 5, maxLength: 120 }
+        category_id: { type: integer, description: leaf categories only (BR-06.1) }
+        description: { type: string, maxLength: 2000 }
+        price_model: { type: string, enum: [fixed, range] }
+        price_fixed: { $ref: '#/components/schemas/Money' }
+        price_min: { $ref: '#/components/schemas/Money' }
+        price_max: { $ref: '#/components/schemas/Money' }
+        unit: { type: string, enum: [dona, m2, pogm, toplam, kg] }
+        weight_class: { type: string, enum: [light, heavy, fragile] }
+
+    ProductCard:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        price_display: { type: string, example: '600 000 so''m' }
+        unit: { type: string }
+        main_photo: { type: string }
+        supplier:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+            rating: { type: number, nullable: true, description: 'null when there are <3 ratings — the UI shows "Yangi"' }
+            is_verified: { type: boolean }
+            verification_level: { type: string, enum: [basic, advanced], nullable: true }
+        category_path: { type: string }
+
+    ProductPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProductCard' } }
+        next_cursor: { type: string, nullable: true }
+
+    OrderCreate:
+      type: object
+      required: [supplier_id, items, dropoff]
+      properties:
+        supplier_id: { type: string, format: uuid }
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [product_id, qty]
+            properties:
+              product_id: { type: string, format: uuid }
+              qty: { type: number }
+              note: { type: string }
+        dropoff:
+          type: object
+          required: [lat, lng, address]
+          properties:
+            lat: { type: number }
+            lng: { type: number }
+            address: { type: string }
+        is_urgent: { type: boolean, default: false }
+        buyer_note: { type: string }
+
+    PriceSummary:
+      type: object
+      properties:
+        items_total: { $ref: '#/components/schemas/Money' }
+        logistics_fee: { $ref: '#/components/schemas/Money' }
+        total_estimate: { $ref: '#/components/schemas/Money' }
+        is_estimate: { type: boolean, description: 'true for a range product — the UI shows "Taxminiy summa"' }
+
+    OrderSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        reference: { type: string, example: 'BN-1042' }
+        status: { type: string }
+        supplier_name: { type: string }
+        item_summary: { type: string }
+        total_amount: { $ref: '#/components/schemas/Money' }
+        is_urgent: { type: boolean }
+        updated_at: { type: string, format: date-time }
+
+    OrderDetail:
+      allOf:
+        - $ref: '#/components/schemas/OrderSummary'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  product_snapshot: { type: object, description: 'product card snapshot (BR-08 DB)' }
+                  qty: { type: number }
+                  unit_price: { $ref: '#/components/schemas/Money' }
+                  line_total: { $ref: '#/components/schemas/Money' }
+            events:
+              type: array
+              description: Append-only timeline (BR-08.2)
+              items:
+                type: object
+                properties:
+                  from_status: { type: string }
+                  to_status: { type: string }
+                  actor_role: { type: string }
+                  created_at: { type: string, format: date-time }
+                  photo_url: { type: string, nullable: true }
+            dropoff_address: { type: string }
+            invoice_no: { type: string, nullable: true }
+
+    ProposalInput:
+      type: object
+      required: [items, prep_days]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [product_id, unit_price]
+            properties:
+              product_id: { type: string, format: uuid }
+              unit_price: { $ref: '#/components/schemas/Money' }
+        prep_days: { type: integer }
+        note: { type: string, maxLength: 300, description: 'phone numbers are masked (BR-09.6)' }
+
+    Invoice:
+      type: object
+      properties:
+        invoice_no: { type: string, example: 'BIN-202607-00042' }
+        version: { type: integer }
+        status: { type: string, enum: [active, paid, voided, expired] }
+        amount: { $ref: '#/components/schemas/Money' }
+        pdf_url: { type: string }
+        expires_at: { type: string, format: date-time }
+        versions:
+          type: array
+          items:
+            type: object
+            properties:
+              version: { type: integer }
+              status: { type: string }
+
+    DriverOffer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        mode: { type: string, enum: [classic, urgent] }
+        pickup_address: { type: string }
+        dropoff_address: { type: string }
+        cargo_class: { type: string }
+        delivery_fee: { $ref: '#/components/schemas/Money' }
+        driver_share: { $ref: '#/components/schemas/Money' }
+        expires_at: { type: string, format: date-time }

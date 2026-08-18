@@ -1,0 +1,24 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: '*.dart'
+      run: dart format --set-exit-if-changed {staged_files}
+    analyze:
+      run: flutter analyze
+    todo:
+      run: scripts/todo-gate.sh
+    tokens:
+      run: scripts/tokens-gate.sh
+    l10n:
+      run: scripts/l10n-gate.sh
+    banned-copy:
+      run: scripts/banned-copy.sh
+    a11y:
+      run: scripts/a11y-gate.sh
+pre-push:
+  commands:
+    arch:
+      run: flutter test test/arch
+    unit:
+      run: flutter test

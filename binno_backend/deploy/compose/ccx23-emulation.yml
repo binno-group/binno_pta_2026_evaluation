@@ -1,0 +1,61 @@
+services:
+  nginx:
+    cpuset: "0-3"
+    mem_limit: 256m
+
+  binno:
+    cpuset: "0-3"
+    mem_limit: 1g
+
+  dispatcher:
+    cpuset: "0-3"
+    mem_limit: 512m
+
+  postgres-oltp:
+    cpuset: "0-3"
+    mem_limit: 4g
+    command: >-
+      postgres
+      -c shared_buffers=1GB
+      -c effective_cache_size=4GB
+      -c work_mem=16MB
+      -c maintenance_work_mem=256MB
+      -c max_connections=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_parallel_workers_per_gather=0
+      -c max_worker_processes=4
+      -c max_wal_size=2GB
+      -c wal_compression=on
+      -c checkpoint_completion_target=0.9
+      -c track_io_timing=on
+
+  postgres-analytics:
+    cpuset: "0-3"
+    mem_limit: 768m
+    command: >-
+      postgres
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c work_mem=8MB
+      -c max_connections=30
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_parallel_workers_per_gather=0
+      -c max_worker_processes=2
+      -c max_wal_size=1GB
+      -c wal_compression=on
+
+  redis:
+    cpuset: "0-3"
+    mem_limit: 1200m
+    command: >-
+      redis-server
+      --maxmemory 1gb
+      --maxmemory-policy volatile-ttl
+      --save 900 1
+      --appendonly no
+
+  clickhouse:
+    cpuset: "0-3"
+    mem_limit: 1g

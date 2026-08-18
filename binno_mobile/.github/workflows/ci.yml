@@ -1,0 +1,94 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 1 * * *'
+
+jobs:
+  analyze-and-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: dart run build_runner build --delete-conflicting-outputs
+      - run: flutter gen-l10n
+      - run: dart format --set-exit-if-changed .
+      - run: flutter analyze
+      - run: scripts/todo-gate.sh
+      - run: scripts/tokens-gate.sh
+      - run: scripts/l10n-gate.sh
+      - run: scripts/banned-copy.sh
+      - run: scripts/tokens-drift.sh
+      - run: scripts/adr-trace.sh
+      - run: scripts/a11y-gate.sh
+      - run: scripts/golden-budget.sh
+      - run: flutter test test/arch
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter test --coverage
+      - run: scripts/coverage-gate.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: golden-failures
+          path: '**/failures/*.png'
+
+  api-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: npm install -g @openapitools/openapi-generator-cli
+      - run: flutter pub get
+      - run: scripts/api-drift.sh
+
+  build:
+    needs: [analyze-and-gates, api-drift, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build appbundle --flavor staging --target lib/main_staging.dart --debug
+
+  perf:
+    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          profile: pixel_6
+          script: flutter drive --profile --driver=test_driver/perf_driver.dart --target=integration_test/perf/scroll_perf_test.dart
+      - run: scripts/perf-budget.sh
